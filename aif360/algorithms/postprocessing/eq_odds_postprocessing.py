@@ -28,6 +28,11 @@
 # under the License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR
 # CONDITIONS OF ANY KIND, either express or implied. See the License for the
 # specific language governing permissions and limitations under the License.
+from __future__ import absolute_import
+from __future__ import division
+from __future__ import print_function
+from __future__ import unicode_literals
+
 import numpy as np
 from scipy.optimize import linprog
 
@@ -49,24 +54,35 @@ class EqOddsPostprocessing(Transformer):
            Information Processing Systems, 2017.
     """
 
-    def __init__(self, unprivileged_groups, privileged_groups, seed=None):
+    def __init__(self, unprivileged_groups, privileged_groups, loss_name, seed=None):
         """
         Args:
             unprivileged_groups (list(dict)): Representation for unprivileged
                 group.
             privileged_groups (list(dict)): Representation for privileged
                 group.
+            loss_name (str): Name of the loss to use. Allowed options are
+                "Balanced accuracy groupwise", "Balanced accuracy", "Accuracy"
             seed (int, optional): Seed to make `predict` repeatable.
         """
         super(EqOddsPostprocessing, self).__init__(
             unprivileged_groups=unprivileged_groups,
             privileged_groups=privileged_groups,
+            loss_name=loss_name,
             seed=seed)
+
+        allowed_losses = ["Balanced accuracy groupwise",
+                          "Balanced accuracy",
+                          "Accuracy"]
 
         self.seed = seed
         self.model_params = None
         self.unprivileged_groups = unprivileged_groups
         self.privileged_groups = privileged_groups
+        self.loss_name = loss_name
+
+        if self.loss_name not in allowed_losses:
+            raise ValueError("loss name not in the list of allowed losses")
 
     def fit(self, dataset_true, dataset_pred):
         """Compute parameters for equalizing odds using true and predicted
@@ -85,9 +101,23 @@ class EqOddsPostprocessing(Transformer):
             privileged_groups=self.privileged_groups)
 
         # compute basic statistics
-        sbr = metric.num_instances(privileged=True) / metric.num_instances()
-        obr = metric.num_instances(privileged=False) / metric.num_instances()
+        # sbr = metric.num_instances(privileged=True) / metric.num_instances()
+        # obr = metric.num_instances(privileged=False) / metric.num_instances()
+        # Base rates for the two groups
+        sbr = metric.base_rate(privileged=True)
+        obr = metric.base_rate(privileged=False)
 
+        # print("Base rates for privileged and unprivileged groups")
+        # print(sbr, obr)
+
+        # Proportion of group sizes
+        gr = metric.num_instances(privileged=True) / metric.num_instances()
+
+        # Proportion of positives and negatives
+        pr = metric.num_positives(privileged=True) / metric.num_positives()
+        nr = metric.num_negatives(privileged=True) / metric.num_negatives()
+
+        # Other rates
         fpr0 = metric.false_positive_rate(privileged=True)
         fpr1 = metric.false_positive_rate(privileged=False)
         fnr0 = metric.false_negative_rate(privileged=True)
@@ -97,13 +127,30 @@ class EqOddsPostprocessing(Transformer):
         tnr0 = metric.true_negative_rate(privileged=True)
         tnr1 = metric.true_negative_rate(privileged=False)
 
+        # print("Other rates")
+        # print(fpr0, fpr1, fnr0, fnr1, tpr0, tpr1, tnr0, tnr1)
+
         # linear program has 4 decision variables:
         # [Pr[label_tilde = 1 | label_hat = 1, protected_attributes = 0];
         #  Pr[label_tilde = 1 | label_hat = 0, protected_attributes = 0];
         #  Pr[label_tilde = 1 | label_hat = 1, protected_attributes = 1];
         #  Pr[label_tilde = 1 | label_hat = 0, protected_attributes = 1]]
         # Coefficients of the linear objective function to be minimized.
-        c = np.array([fpr0 - tpr0, tnr0 - fnr0, fpr1 - tpr1, tnr1 - fnr1])
+        if self.loss_name == "Balanced accuracy groupwise":
+            c = np.array([fpr0 - tpr0, tnr0 - fnr0, fpr1 - tpr1, tnr1 - fnr1])
+        elif self.loss_name == "Balanced accuracy":
+            c = np.array([nr*fpr0 - pr*tpr0,
+                          nr*tnr0 - pr*fnr0,
+                          (1.0-nr)*fpr1 - (1.0-pr)*tpr1,
+                          (1.0-nr)*tnr1 - (1.0-pr)*fnr1])
+        elif self.loss_name == "Accuracy":
+            c = np.array([gr*((1-sbr)*fpr0 - sbr*tpr0),
+                          gr*((1-sbr)*tnr0 - sbr*fnr0),
+                          (1.0-gr)*((1-obr)*fpr1 - obr*tpr1),
+                          (1.0-gr)*((1-obr)*tnr1 - obr*fnr1)])
+
+        # print("Linear constraint multiplier")
+        # print(c)
 
         # A_ub - 2-D array which, when matrix-multiplied by x, gives the values
         # of the upper-bound inequality constraints at x
@@ -189,6 +236,9 @@ class EqOddsPostprocessing(Transformer):
         # Linear program
         self.model_params = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq)
 
+        # print("model parameters")
+        # print(self.model_params)
+
         return self
 
     def predict(self, dataset):
@@ -242,7 +292,8 @@ class EqOddsPostprocessing(Transformer):
         othr_fair_pred[p2n_indices] = dataset.unfavorable_label
 
         # Mutated, fairer dataset with new labels
-        dataset_new = dataset.copy()
+        # print("create a new dataset")
+        dataset_new = dataset.copy(deepcopy=False)
 
         new_labels = np.zeros_like(dataset.labels, dtype=np.float64)
         new_labels[cond_vec_priv] = self_fair_pred
